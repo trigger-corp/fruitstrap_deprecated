@@ -3,43 +3,59 @@
 #import <CoreFoundation/CoreFoundation.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <stdio.h>
 #include <signal.h>
 #include <getopt.h>
 #include <pwd.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include "MobileDevice.h"
 
 #define FDVENDOR_PATH  "/tmp/fruitstrap-remote-debugserver"
-#define PREP_CMDS_PATH "/tmp/fruitstrap-gdb-prep-cmds"
-#define GDB_SHELL      "--arch armv7f -x " PREP_CMDS_PATH
+#define PREP_CMDS_PATH "/tmp/fruitstrap-lldb-prep-cmds"
+#define PYTHON_MODULE_PATH "/tmp/fruitstrap.py"
+#define LLDB_SHELL "python -u -c \"import time; time.sleep(0.5); print 'run'; time.sleep(2000000)\" | /usr/bin/lldb -s " PREP_CMDS_PATH
 
-// approximation of what Xcode does:
-#define GDB_PREP_CMDS CFSTR("set mi-show-protections off\n\
-    set auto-raise-load-levels 1\n\
-    set shlib-path-substitutions /usr \"{ds_path}/Symbols/usr\" /System \"{ds_path}/Symbols/System\" \"{device_container}\" \"{disk_container}\" \"/private{device_container}\" \"{disk_container}\" /Developer \"{ds_path}/Symbols/Developer\"\n\
-    set remote max-packet-size 1024\n\
-    set sharedlibrary check-uuids on\n\
-    set env NSUnbufferedIO YES\n\
-    set minimal-signal-handling 1\n\
-    set sharedlibrary load-rules \\\".*\\\" \\\".*\\\" container\n\
-    set inferior-auto-start-dyld 0\n\
-    file \"{disk_app}\"\n\
-    set remote executable-directory {device_app}\n\
-    set remote noack-mode 1\n\
-    set trust-readonly-sections 1\n\
-    target remote-mobile " FDVENDOR_PATH "\n\
-    mem 0x1000 0x3fffffff cache\n\
-    mem 0x40000000 0xffffffff none\n\
-    mem 0x00000000 0x0fff none\n\
-    run {args}\n\
-    set minimal-signal-handling 0\n\
-    set inferior-auto-start-cfm off\n\
-    set sharedLibrary load-rules dyld \".*libobjc.*\" all dyld \".*CoreFoundation.*\" all dyld \".*Foundation.*\" all dyld \".*libSystem.*\" all dyld \".*AppKit.*\" all dyld \".*PBGDBIntrospectionSupport.*\" all dyld \".*/usr/lib/dyld.*\" all dyld \".*CarbonDataFormatters.*\" all dyld \".*libauto.*\" all dyld \".*CFDataFormatters.*\" all dyld \"/System/Library/Frameworks\\\\\\\\|/System/Library/PrivateFrameworks\\\\\\\\|/usr/lib\" extern dyld \".*\" all exec \".*\" all\n\
-    sharedlibrary apply-load-rules all\n\
-    set inferior-auto-start-dyld 1\n\
-    continue\n\
-    quit")
+/*
+ * Startup script passed to lldb.
+ * To see how xcode interacts with lldb, put this into .lldbinit:
+ * log enable -v -f /Users/vargaz/lldb.log lldb all
+ * log enable -v -f /Users/vargaz/gdb-remote.log gdb-remote all
+ */
+#define LLDB_PREP_CMDS CFSTR("\
+    script fruitstrap_device_app=\"{device_app}\"\n\
+    script fruitstrap_connect_url=\"connect://127.0.0.1:12345\"\n\
+    platform select remote-ios\n\
+    target create \"{disk_app}\"\n\
+    #settings set target.process.extra-startup-command \"QSetLogging:bitmask=LOG_ALL;\"\n \
+    command script import \"" PYTHON_MODULE_PATH "\"\n\
+")
+
+/*
+ * Some things do not seem to work when using the normal commands like process connect/launch, so we invoke them 
+ * through the python interface. Also, Launch () doesn't seem to work when ran from init_module (), so we add
+ * a command which can be used by the user to run it.
+ */
+#define LLDB_FRUITSTRAP_MODULE CFSTR("\
+import lldb\n\
+\n\
+def __lldb_init_module(debugger, internal_dict):\n\
+    # These two are passed in by the script which loads us\n\
+    device_app=internal_dict['fruitstrap_device_app']\n\
+    connect_url=internal_dict['fruitstrap_connect_url']\n\
+    lldb.target.modules[0].SetPlatformFileSpec(lldb.SBFileSpec(device_app))\n\
+    lldb.debugger.HandleCommand (\"command script add -s asynchronous -f fruitstrap.fsrun_command run\")\n\
+    error=lldb.SBError()\n\
+    lldb.target.ConnectRemote(lldb.target.GetDebugger().GetListener(),connect_url,None,error)\n\
+\n\
+def fsrun_command(debugger, command, result, internal_dict):\n\
+    error=lldb.SBError()\n\
+    lldb.target.Launch(lldb.SBLaunchInfo(None),error)\n\
+")
+
 
 typedef struct am_device * AMDeviceRef;
 int AMDeviceSecureTransferPath(int zero, AMDeviceRef device, CFURLRef url, CFDictionaryRef options, void *callback, int cbarg);
@@ -51,7 +67,6 @@ bool found_device = false, debug = false, verbose = false, unbuffered = false;
 char *app_path = NULL;
 char *device_id = NULL;
 char *args = NULL;
-char *gdb_args = "";
 int timeout = 0;
 CFStringRef last_path = NULL;
 service_conn_t gdbfd;
@@ -298,41 +313,6 @@ mach_error_t install_callback(CFDictionaryRef dict, int arg) {
     return 0;
 }
 
-void fdvendor_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info) {
-    CFSocketNativeHandle socket = (CFSocketNativeHandle)(*((CFSocketNativeHandle *)data));
-
-    struct msghdr message;
-    struct iovec iov[1];
-    struct cmsghdr *control_message = NULL;
-    char ctrl_buf[CMSG_SPACE(sizeof(int))];
-    char dummy_data[1];
-
-    memset(&message, 0, sizeof(struct msghdr));
-    memset(ctrl_buf, 0, CMSG_SPACE(sizeof(int)));
-
-    dummy_data[0] = ' ';
-    iov[0].iov_base = dummy_data;
-    iov[0].iov_len = sizeof(dummy_data);
-
-    message.msg_name = NULL;
-    message.msg_namelen = 0;
-    message.msg_iov = iov;
-    message.msg_iovlen = 1;
-    message.msg_controllen = CMSG_SPACE(sizeof(int));
-    message.msg_control = ctrl_buf;
-
-    control_message = CMSG_FIRSTHDR(&message);
-    control_message->cmsg_level = SOL_SOCKET;
-    control_message->cmsg_type = SCM_RIGHTS;
-    control_message->cmsg_len = CMSG_LEN(sizeof(int));
-
-    *((int *) CMSG_DATA(control_message)) = gdbfd;
-
-    sendmsg(socket, &message, 0);
-    CFSocketInvalidate(s);
-    CFRelease(s);
-}
-
 CFURLRef copy_device_app_url(AMDeviceRef device, CFStringRef identifier) {
     CFDictionaryRef result;
     assert(AMDeviceLookupApplications(device, 0, &result) == 0);
@@ -363,8 +343,8 @@ CFStringRef copy_disk_app_identifier(CFURLRef disk_app_url) {
     return bundle_identifier;
 }
 
-void write_gdb_prep_cmds(AMDeviceRef device, CFURLRef disk_app_url) {
-    CFMutableStringRef cmds = CFStringCreateMutableCopy(NULL, 0, GDB_PREP_CMDS);
+void write_lldb_prep_cmds(AMDeviceRef device, CFURLRef disk_app_url) {
+    CFMutableStringRef cmds = CFStringCreateMutableCopy(NULL, 0, LLDB_PREP_CMDS);
     CFRange range = { 0, CFStringGetLength(cmds) };
 
     CFStringRef ds_path = copy_device_support_path(device);
@@ -408,6 +388,12 @@ void write_gdb_prep_cmds(AMDeviceRef device, CFURLRef disk_app_url) {
     fwrite(CFDataGetBytePtr(cmds_data), CFDataGetLength(cmds_data), 1, out);
     fclose(out);
 
+    CFMutableStringRef pmodule = CFStringCreateMutableCopy(NULL, 0, LLDB_FRUITSTRAP_MODULE);
+    CFDataRef pmodule_data = CFStringCreateExternalRepresentation(NULL, pmodule, kCFStringEncodingASCII, 0);
+    out = fopen(PYTHON_MODULE_PATH, "w");
+    fwrite(CFDataGetBytePtr(pmodule_data), CFDataGetLength(pmodule_data), 1, out);
+    fclose(out);
+
     CFRelease(cmds);
     if (ds_path != NULL) CFRelease(ds_path);
     CFRelease(bundle_identifier);
@@ -422,22 +408,82 @@ void write_gdb_prep_cmds(AMDeviceRef device, CFURLRef disk_app_url) {
     CFRelease(cmds_data);
 }
 
-void start_remote_debug_server(AMDeviceRef device) {
-    assert(AMDeviceStartService(device, CFSTR("com.apple.debugserver"), &gdbfd, NULL) == 0);
+CFSocketRef server_socket;
+CFSocketRef lldb_socket;
+CFWriteStreamRef serverWriteStream = NULL;
+CFWriteStreamRef lldbWriteStream = NULL;
 
-    CFSocketRef fdvendor = CFSocketCreate(NULL, AF_UNIX, 0, 0, kCFSocketAcceptCallBack, &fdvendor_callback, NULL);
+void
+server_callback (CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info)
+{
+    int res;
+
+    //PRINT ("server: %s\n", CFDataGetBytePtr (data));
+
+    if (CFDataGetLength (data) == 0) {
+        // FIXME: Close the socket
+        //shutdown (CFSocketGetNative (lldb_socket), SHUT_RDWR);
+        //close (CFSocketGetNative (lldb_socket));
+        return;
+    }
+    res = write (CFSocketGetNative (lldb_socket), CFDataGetBytePtr (data), CFDataGetLength (data)); 
+}
+
+void lldb_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info)
+{
+    //PRINT ("lldb: %s\n", CFDataGetBytePtr (data));
+
+    if (CFDataGetLength (data) == 0)
+        return;
+    write (gdbfd, CFDataGetBytePtr (data), CFDataGetLength (data));
+}
+
+void fdvendor_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info) {
+    CFSocketNativeHandle socket = (CFSocketNativeHandle)(*((CFSocketNativeHandle *)data));
+
+    assert (callbackType == kCFSocketAcceptCallBack);
+    //PRINT ("callback!\n");
+
+    lldb_socket  = CFSocketCreateWithNative(NULL, socket, kCFSocketDataCallBack, &lldb_callback, NULL);
+    CFRunLoopAddSource(CFRunLoopGetMain(), CFSocketCreateRunLoopSource(NULL, lldb_socket, 0), kCFRunLoopCommonModes);
+}
+
+void start_remote_debug_server(AMDeviceRef device) {
+    char buf [256];
+    int res, err, i;
+    char msg [256];
+    int chsum, len;
+    struct stat s;
+    socklen_t buflen;
+    struct sockaddr name;
+    int namelen;
+
+    assert(AMDeviceStartService(device, CFSTR("com.apple.debugserver"), &gdbfd, NULL) == 0);
+    assert (gdbfd);
+
+    /*
+     * The debugserver connection is through a fd handle, while lldb requires a host/port to connect, so create an intermediate
+     * socket to transfer data.
+     */
+    server_socket = CFSocketCreateWithNative (NULL, gdbfd, kCFSocketDataCallBack, &server_callback, NULL);
+    CFRunLoopAddSource(CFRunLoopGetMain(), CFSocketCreateRunLoopSource(NULL, server_socket, 0), kCFRunLoopCommonModes);
+
+    struct sockaddr_in addr4;
+    memset(&addr4, 0, sizeof(addr4));
+    addr4.sin_len = sizeof(addr4);
+    addr4.sin_family = AF_INET;
+    addr4.sin_port = htons(12345);
+    addr4.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    CFSocketRef fdvendor = CFSocketCreate(NULL, PF_INET, 0, 0, kCFSocketAcceptCallBack, &fdvendor_callback, NULL);
 
     int yes = 1;
     setsockopt(CFSocketGetNative(fdvendor), SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    int flag = 1; 
+    res = setsockopt(CFSocketGetNative(fdvendor), IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(int));
+    assert (res == 0);
 
-    struct sockaddr_un address;
-    memset(&address, 0, sizeof(address));
-    address.sun_family = AF_UNIX;
-    strcpy(address.sun_path, FDVENDOR_PATH);
-    address.sun_len = SUN_LEN(&address);
-    CFDataRef address_data = CFDataCreate(NULL, (const UInt8 *)&address, sizeof(address));
-
-    unlink(FDVENDOR_PATH);
+    CFDataRef address_data = CFDataCreate(NULL, (const UInt8 *)&addr4, sizeof(addr4));
 
     CFSocketSetAddress(fdvendor, address_data);
     CFRelease(address_data);
@@ -445,11 +491,12 @@ void start_remote_debug_server(AMDeviceRef device) {
 }
 
 void killed(int signum) {
-    killpg(child_pid, SIGTERM);
+    // SIGKILL needed to kill lldb, probably a better way to do this.
+    kill(0, SIGKILL);
     _exit(0);
 }
 
-void gdb_ready_handler(int signum)
+void lldb_finished_handler(int signum)
 {
     _exit(0);
 }
@@ -532,36 +579,25 @@ void handle_device(AMDeviceRef device) {
 
     mount_developer_image(device);      // put debugserver on the device
     start_remote_debug_server(device);  // start debugserver
-    write_gdb_prep_cmds(device, url);   // dump the necessary gdb commands into a file
+    write_lldb_prep_cmds(device, url);   // dump the necessary lldb commands into a file
 
     CFRelease(url);
 
     printf("[100%%] Connecting to remote debug server\n");
     printf("-------------------------\n");
 
-    signal(SIGHUP, gdb_ready_handler);
+    signal(SIGHUP, lldb_finished_handler);
+
+    setpgid(getpid(), 0);
 
     pid_t parent = getpid();
     int pid = fork();
     if (pid == 0) {
-        CFStringRef path = copy_xcode_path_for(CFSTR("Platforms/iPhoneOS.platform/Developer/usr/libexec/gdb/gdb-arm-apple-darwin"));
-        if (path == NULL) {
-             printf("[ !! ] Unable to locate GDB.\n");
-             exit(1);
-        } else {
-            CFStringRef gdb_cmd = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@ %@ %s"), path, CFSTR(GDB_SHELL), gdb_args);
- 
-            // Convert CFStringRef to char* for system call
-            const char *char_gdb_cmd = CFStringGetCStringPtr(gdb_cmd, kCFStringEncodingMacRoman);
-
-            system(char_gdb_cmd);      // launch gdb
-        }
+        system(LLDB_SHELL);      // launch lldb
         kill(parent, SIGHUP);  // "No. I am your father."
         _exit(0);
     }
 
-    child_pid = pid;
-    setpgid(pid, 0); // Set process group of child to child's pid
     signal(SIGINT, killed);
     signal(SIGTERM, killed);
 }
@@ -595,7 +631,6 @@ int main(int argc, char *argv[]) {
         { "verbose", no_argument, NULL, 'v' },
         { "timeout", required_argument, NULL, 't' },
         { "unbuffered", no_argument, NULL, 'u' },
-        { "gbdbargs", required_argument, NULL, 'g' },
         { NULL, 0, NULL, 0 },
     };
     char ch;
@@ -623,9 +658,6 @@ int main(int argc, char *argv[]) {
             break;
         case 'u':
             unbuffered = 1;
-            break;
-        case 'g':
-            gdb_args = optarg;
             break;
         default:
             usage(argv[0]);
