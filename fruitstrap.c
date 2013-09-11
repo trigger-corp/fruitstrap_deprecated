@@ -17,7 +17,7 @@
 #define FDVENDOR_PATH  "/tmp/fruitstrap-remote-debugserver"
 #define PREP_CMDS_PATH "/tmp/fruitstrap-lldb-prep-cmds"
 #define PYTHON_MODULE_PATH "/tmp/fruitstrap.py"
-#define LLDB_SHELL "python -u -c \"import time; time.sleep(0.5); print 'run'; time.sleep(2000000)\" | /usr/bin/lldb -s " PREP_CMDS_PATH
+#define LLDB_SHELL "python -u -c \"import time; time.sleep(0.5); print 'run'; time.sleep(2000000)\" | lldb -s " PREP_CMDS_PATH
 
 /*
  * Startup script passed to lldb.
